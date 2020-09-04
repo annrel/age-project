@@ -1,0 +1,375 @@
+---
+title: "AGE project"
+author: "Anna Rodionova"
+output: 
+  html_document:
+    # code_folding: "show"
+    df_print: "paged"
+    toc: true
+    toc_float: true
+    toc_collapsed: false
+    toc_depth: 4
+    number_sections: false
+    theme: "united"
+    self_contained: true
+    css: "stylesheet.css"
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+The data are from https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE156123 - Analysis of cerebrovascular dysfunction caused by chronic social defeat in mice. Overall design:  wild-type mice were exposed to stressor for 10 min every day for 1 day, 7 days and 14 days. Three to Four animals per group were studied, for a total of 19 animals.
+
+
+```{r message=FALSE, warning=FALSE}
+library(oligo)
+library(stringr)
+library(tidyr)
+library(glue)
+library(limma)
+library(ReportingTools)
+library(lattice)
+library(sva)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(janitor)
+library(affycoretools)
+library(pd.mta.1.0)
+library(clusterProfiler)
+library(gplots)
+
+source("/data/shared/AGE2020/Exercises/age_library.R")
+```
+# Reading the data
+```{r message=FALSE, warning=FALSE}
+base <- '/home/rodionova/AGE/GSE156123_RAW/celfiles/'
+celfiles <- list.files(base, full = TRUE)
+raw_data <- read.celfiles(celfiles)
+```
+
+
+```{r}
+pheno_data <- readr::read_delim("GSE156123_RAW/sheet_file.csv", delim = ",") %>%
+  dplyr::select(2, 4, 7) %>%
+  magrittr::set_colnames(c("sample_name", "sample_group", "group_type")) %>%
+  dplyr::mutate(
+    cel_file = celfiles,
+    sample_group = str_replace_all(sample_group, " ", "_"),
+    sample_group = str_to_lower(sample_group) %>% factor() %>% relevel("home_caged")) %>%
+  dplyr::select(sample_name, sample_group, group_type, cel_file)
+row.names(pheno_data) <- pheno_data$sample_name
+
+```
+
+```{r}
+sampleNames(raw_data) <- pheno_data$sample_name
+
+metadata <- data.frame(
+  labelName = colnames(pheno_data),
+  labelDescription = c("Name", "Used factor", "Group", "File"),
+  stringsAsFactors = FALSE
+)
+
+```
+
+```{r message=FALSE, warning=FALSE}
+pheno_data <- AnnotatedDataFrame(data = pheno_data, varMetadata = metadata)
+phenoData(raw_data) <- Biobase::combine(phenoData(raw_data), pheno_data)
+pData(raw_data)
+pheno_data
+```
+
+```{r}
+image(raw_data, which=17, transfo = log2)
+```
+
+
+```{r message=FALSE, warning=FALSE, fig.height=8, fig.width=10} 
+MAplot(raw_data, groups = pData(raw_data)$sample_group, pairs = TRUE)
+```
+
+
+
+
+```{r}
+boxplot(raw_data[1:10000,], "all", las=3)
+```
+
+
+```{r}
+fit_plm <- fitProbeLevelModel(raw_data)
+```
+
+```{r}
+image(fit_plm, which=17)
+```
+
+```{r}
+image(fit_plm, which = 17, type = "sign.residuals")
+```
+
+
+```{r}
+RLE(fit_plm)
+```
+```{r}
+NUSE(fit_plm)
+```
+```{r}
+library(pd.mta.1.0)
+pd.mta.1.0 
+```
+
+#Normalization
+
+I assumed that first two samples could be low quality one, so I decited take the rest for continios work.
+
+```{r}
+norm_data <- rma(raw_data[,3:19])
+```
+
+```{r}
+feature_data <- annotateEset(norm_data, pd.mta.1.0, columns = c("PROBEID", "ENTREZID", "SYMBOL", "GENENAME"), type = 'core')
+#tail(fData(feature_data))
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages(library(dendextend))
+library(dendextend)
+plot_hc <- function(cp, color_by, color_by_lab, method_distance = "euclidean", method_clustering = "complete") {
+  
+
+  
+  colorList <- c("darkorchid4", "green", "blue", "yellow", "brown", 
+                 "darkcyan", "darkolivegreen3", "red", "lightgreen",
+                 "orange", "orangered1", "seagreen4", "steelblue4")
+  
+
+  
+  distMat <- dist(t(cp), method_distance, method_clustering)
+  clusters <- hclust(distMat)
+  dendr <- as.dendrogram(clusters)
+  
+  
+  dendrColors <- colorList[1:length(levels(color_by))]
+  names(dendrColors) <- levels(color_by)
+  labels_colors(dendr) <- dendrColors[color_by][order.dendrogram(dendr)]
+
+  plot(dendr, main=glue("Hierarchical clustering"))
+  legend("topright", 
+     legend = levels(color_by), 
+     col = dendrColors,
+     title = color_by_lab,
+     pch = c(20,20,4,4,4), bty = "n",  pt.cex = 1.5, cex = 0.8 , 
+     inset = c(0, 0.1))
+}
+
+```
+
+
+```{r message=FALSE, warning=FALSE}
+groups <- as.factor(pData(norm_data)$sample_group)
+names(groups) <- sampleNames(norm_data)
+plot_hc(exprs(norm_data), color_by = norm_data$sample_group,
+  color_by_lab = "Sample group")
+```
+
+
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(ggpubr)
+pca_plot <- function(data){
+  exp_palmieri <- Biobase::exprs(data)
+  PCA <- prcomp(t(exp_palmieri), scale = FALSE)
+  
+  percentVar <- round(100*PCA$sdev^2/sum(PCA$sdev^2),1)
+  sd_ratio <- sqrt(percentVar[2] / percentVar[1])
+  
+  dataGG <- data.frame(PC1 = PCA$x[,1], PC2 = PCA$x[,2], PC3 = PCA$x[,3], 
+                    Conditions = 
+                     Biobase::pData(data)$sample_group)
+  g12 <- ggplot(dataGG, aes(PC1, PC2)) +
+        geom_point(aes(color=Conditions)) +
+    ggtitle("PCA plot of the calibrated, summarized data") +
+    xlab(paste0("PC1, VarExp: ", percentVar[1], "%")) +
+    ylab(paste0("PC2, VarExp: ", percentVar[2], "%")) +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    coord_fixed(ratio = sd_ratio) +
+    scale_shape_manual(values = c(4,15)) + 
+    scale_color_manual(values = c("darkorchid4", "green", "blue", "yellow", "brown", 
+                  "darkcyan", "darkolivegreen3", "red", "lightgreen",
+                  "orange", "orangered1", "seagreen4", "steelblue4"))
+   g13 <- ggplot(dataGG, aes(PC1, PC3)) +
+        geom_point(aes(color=Conditions)) +
+    ggtitle("PCA plot of the calibrated, summarized data") +
+    xlab(paste0("PC1, VarExp: ", percentVar[1], "%")) +
+    ylab(paste0("PC2, VarExp: ", percentVar[2], "%")) +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    coord_fixed(ratio = sd_ratio) +
+    scale_shape_manual(values = c(4,15)) + 
+    scale_color_manual(values = c("darkorchid4", "green", "blue", "yellow", "brown", 
+                  "darkcyan", "darkolivegreen3", "red", "lightgreen",
+                  "orange", "orangered1", "seagreen4", "steelblue4"))
+    g23 <- ggplot(dataGG, aes(PC2, PC3)) +
+        geom_point(aes(color=Conditions)) +
+    ggtitle("PCA plot of the calibrated, summarized data") +
+    xlab(paste0("PC1, VarExp: ", percentVar[1], "%")) +
+    ylab(paste0("PC2, VarExp: ", percentVar[2], "%")) +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    coord_fixed(ratio = sd_ratio) +
+    scale_shape_manual(values = c(4,15)) + 
+    scale_color_manual(values = c("darkorchid4", "green", "blue", "yellow", "brown", 
+                  "darkcyan", "darkolivegreen3", "red", "lightgreen",
+                  "orange", "orangered1", "seagreen4", "steelblue4"))
+    
+    ggarrange(g12, g13, g23, 
+          ncol = 2, nrow = 2,
+          common.legend = TRUE, legend="bottom")
+}
+
+```
+
+```{r}
+pca_plot(norm_data)
+```
+
+
+
+
+```{r message=FALSE, warning=FALSE}
+
+
+heatmap.2(exprs(norm_data)[1:1000,],col=redgreen(100), key=FALSE, scale="row", density.info="none", trace="none",cexRow=0.25, cexCol=0.7 )
+
+
+```
+
+
+```{r}
+group <- pData(norm_data)$sample_group %>% factor() %>% relevel("home_caged")
+dea_model <- model.matrix(~ group)
+colnames(dea_model)[1] <- "Intercept"
+dea_model
+```
+```{r}
+fit <- lmFit(norm_data, dea_model) %>% eBayes()
+colnames(fit)
+```
+```{r}
+topTable(fit, coef = 5)
+```
+```{r}
+output_groups <- levels(groups)
+output_groups <- output_groups[output_groups != "home_cage"]
+
+rep_theme <- reporting.theme()
+lattice.options(default.theme = rep_theme)
+
+REPORT_DIR <- "html_report"
+REPORT_N_GENES <- 50
+REPORT_LFC_THRESHOLD <- 1
+REPORT_P_VALUE_THRESHOLD <- 0.1
+REPORT_P_VALUE_ADJUST_METHOD <- "fdr"
+
+for (group in output_groups) {
+  cat(glue("\nDEA for group '{group}': ", .trim = FALSE))
+  
+  tryCatch(
+    {
+      # This is an object (and a file) to which we are publishing.
+      de_report <- HTMLReport(
+        shortName = group,
+        title = glue("{group} vs. control"),
+        reportDirectory = REPORT_DIR
+      )
+      
+      # We can control what to take from topTable.
+      # Here, we want top REPORT_N_GENES DE genes (ranked by p-value adjusted by FDR) with minimal LFC of 1 (i.e. two-fold up or down).
+      # We won't be much conservative and set adjusted p-value cutoff to 0.1. That means we expect 10% of our DE genes to be false positives.
+      publish(
+        fit,
+        de_report,
+        eSet = norm_data,
+        factor = groups,
+        coef = glue("group{group}"),
+        n = REPORT_N_GENES,#variable
+        lfc = REPORT_LFC_THRESHOLD, #1
+        pvalueCutoff = REPORT_P_VALUE_THRESHOLD, #0.1
+        adjust.method = REPORT_P_VALUE_ADJUST_METHOD
+      )
+      
+      finish(de_report)
+      
+      cat(glue("<a href='{DE_REPORT_DIR}/{group}.html' target='_blank'>report</a>"))
+    },
+    
+    error = function(e) {
+      cat(e$message)
+  })
+}
+```
+There's we have wery interesting result. From the first day under stress there's underexpressed gene for asporin, that trend is maintained till the end of experement. On the second week there's up to 9 differently expressed genes.
+
+```{r}
+data_long <- exprs(feature_data)[10000:10010, ] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("PROBEID") %>%
+  tidyr::pivot_longer(-PROBEID, names_to = "sample_name", values_to = "E") %>%
+  dplyr::left_join(fData(feature_data), by = "PROBEID") %>%
+  dplyr::left_join(pData(feature_data), by = "sample_name")
+
+tail(data_long)
+```
+
+#GSEA
+
+For Gene Set Enrichment Analysis I decited to take the most different group from control one.
+
+```{r}
+toGSEA <- topTable(fit, coef = "groupstressed_for_14_days", number=72000)
+featureDataGSEA <- dplyr::left_join(cbind(PROBEID = rownames(toGSEA), toGSEA), fData(feature_data), by = "PROBEID", copy=TRUE)
+entrez_ids <- bitr(featureDataGSEA$SYMBOL, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = "org.Mm.eg.db")
+
+
+entrez_ids <- entrez_ids[!duplicated(entrez_ids$ENTREZID), ]
+res_dex_shrink <- dplyr::left_join(entrez_ids, featureDataGSEA, by = "SYMBOL", copy=TRUE)
+
+entrez_wald <- res_dex_shrink$logFC
+names(entrez_wald) <- res_dex_shrink$ENTREZID
+
+# Sort by decreasing Wald statistic.
+entrez_wald <- entrez_wald[order(entrez_wald, decreasing = TRUE)]
+
+#gseKEGG(entrez_wald)
+```
+
+```{r}
+gsea_kegg_results <- gseKEGG(
+  geneList = entrez_wald,
+  # KEGG organism ID
+  organism = "mmu",
+  # Key type is ENTREZ ID.
+  keyType = "ncbi-geneid",
+  # Run 10 000 permutation tests for each pathway.
+  nPerm = 10000,
+  # Correct p-values for FDR.
+  pAdjustMethod = "fdr",
+  # FDR adjusted p-value threshold.
+  # We are OK with 10% of false positives among all pathways called significant.
+  pvalueCutoff = 0.1,
+  verbose = TRUE
+)
+```
+
+```{r}
+as.data.frame(gsea_kegg_results)
+```
+
+```{r message=FALSE, warning=FALSE}
+dotplot(gsea_kegg_results, showCategory = 15, x = "GeneRatio", font.size = 10)
+```
+
